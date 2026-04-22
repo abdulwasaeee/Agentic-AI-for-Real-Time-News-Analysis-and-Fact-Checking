@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(gh api *)",
+      "Bash(python3 -c \"import sys,json; data=json.load\\(sys.stdin\\); [print\\(i['path']\\) for i in data.get\\('tree',[]\\) if i['type']=='blob']\")",
+      "Bash(git --version)",
+      "Bash(docker --version)",
+      "Bash(pip --version)",
+      "Read(//c/Program Files/**)",
+      "Read(//c/Users/wasae/anaconda3/envs//**)",
+      "Bash(cp -r /c/Users/wasae/task1_repo/src/scraper /c/Users/wasae/factguard-merged/scraper)",
+      "Bash(cp -r /c/Users/wasae/task1_repo/src/preprocessing /c/Users/wasae/factguard-merged/preprocessing)",
+      "Bash(find /c/Users/wasae/factguard-merged/scraper /c/Users/wasae/factguard-merged/preprocessing -name \"*.py\" -exec sed -i 's/from src\\\\.config import Settings/from config import settings/g' {} \\\\;)",
+      "Bash(find /c/Users/wasae/factguard-merged/scraper /c/Users/wasae/factguard-merged/preprocessing -name \"*.py\" -exec sed -i 's/from src\\\\.//g' {} \\\\;)",
+      "Bash(find /c/Users/wasae/factguard-merged/scraper /c/Users/wasae/factguard-merged/preprocessing -name \"*.py\" -exec sed -i 's/from src import/from id_utils import/g' {} \\\\;)"
+    ]
+  }
+}
