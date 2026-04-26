@@ -133,18 +133,6 @@ html, body, [class*="css"] {
     margin-top: 2px;
 }
 
-/* Bias highlight */
-.bias-text {
-    background: #1e2535;
-    border-radius: 12px;
-    padding: 1.2rem;
-    line-height: 2;
-    font-size: 0.95rem;
-}
-.highlight-high { background: rgba(239,68,68,0.25); border-radius: 4px; padding: 1px 4px; }
-.highlight-med { background: rgba(245,158,11,0.2); border-radius: 4px; padding: 1px 4px; }
-.highlight-low { background: rgba(99,102,241,0.15); border-radius: 4px; padding: 1px 4px; }
-
 /* Source pill */
 .source-pill {
     display: inline-block;
@@ -310,43 +298,152 @@ def _run_entity_tracker_background(claim_text_or_name: str, direct_name: str = "
     thread.start()
 
 
-def get_real_verdict(query: str) -> dict:
-    """
-    Call Task 2's Fact-Check Agent (LangGraph pipeline) for a raw claim.
+def _scrape_article(url: str) -> dict:
+    """Fetch og:title, og:description, og:image from a URL. Returns dict with keys: title, description, image_url."""
+    try:
+        import requests
+        from bs4 import BeautifulSoup
+        headers = {"User-Agent": "Mozilla/5.0 (compatible; FactGuard/1.0)"}
+        resp = requests.get(url, timeout=10, headers=headers)
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, "html.parser")
+        def og(prop):
+            tag = soup.find("meta", property=f"og:{prop}") or soup.find("meta", attrs={"name": f"og:{prop}"})
+            return tag["content"].strip() if tag and tag.get("content") else ""
+        title   = og("title") or (soup.title.string.strip() if soup.title else "")
+        desc    = og("description")
+        img_url = og("image")
+        if not desc:
+            # fall back to first <p>
+            p = soup.find("p")
+            desc = p.get_text().strip()[:400] if p else ""
+        return {"title": title, "description": desc, "image_url": img_url}
+    except Exception as e:
+        print(f"[scrape_article] failed for {url}: {e}")
+        return {"title": "", "description": "", "image_url": ""}
 
-    Falls back to an error result if the pipeline is unavailable.
-    """
+
+def get_real_verdict(query: str) -> dict:
+    """Run the LangGraph fact-check pipeline, with URL scraping and human cache lookup."""
+    claim_text = query
+    image_url  = ""
+    source_url = "https://unknown.source"
+
+    # ── URL detection: scrape article ──────────────────────────────────
+    if query.strip().startswith("http"):
+        scraped = _scrape_article(query.strip())
+        title   = scraped["title"]
+        desc    = scraped["description"]
+        image_url  = scraped["image_url"] or ""
+        source_url = query.strip()
+        claim_text = f"{title}. {desc}".strip(" .") if title or desc else query
+        print(f"[get_real_verdict] URL scraped → claim_text={claim_text[:120]!r}  image_url={image_url!r}")
+
+    # ── Human verdict cache ─────────────────────────────────────────────
+    mem = _get_memory()
+    if mem is not None:
+        try:
+            cached = mem.find_human_verdict_for_claim(claim_text)
+            print(f"[get_real_verdict] human_cache result: {cached}")
+            if cached:
+                print(f"[get_real_verdict] human_cache HIT → label={cached['label']}  conf={cached['confidence']}")
+                st.session_state["_last_claim_text"] = claim_text
+                st.session_state["_last_image_url"]  = image_url
+                return {
+                    "label":            cached["label"],
+                    "confidence":       float(cached["confidence"]),
+                    "claim_text":       claim_text[:200],
+                    "evidence_summary": "(Human-corrected verdict from memory)",
+                    "bias_score":       float(cached.get("bias_score", 0.5)),
+                    "image_mismatch":   False,
+                    "image_url":        image_url,
+                    "vlm_caption":      "",
+                    "sources":          [],
+                    "charged_phrases":  [],
+                    "verdict_id":       cached.get("verdict_id", ""),
+                    "claim_id":         cached.get("claim_id", ""),
+                    "_from_cache":      True,
+                }
+        except Exception as _ce:
+            print(f"[get_real_verdict] human_cache MISS (exception): {_ce}")
+
+    # ── Run pipeline ────────────────────────────────────────────────────
     try:
         from agents.fact_check_agent import fact_check_claim
-        output = fact_check_claim(query)
+        output = fact_check_claim(
+            claim_text,
+            source_url=source_url,
+            image_url=image_url or None,
+        )
+
+        st.session_state["_last_claim_text"] = claim_text
+        st.session_state["_last_image_url"]  = image_url
+
+        # Store claim + entities in memory for entity tracker
+        if mem is not None:
+            try:
+                import spacy as _spacy
+                _nlp = _spacy.load("en_core_web_sm")
+                _doc = _nlp(claim_text)
+                _valid_labels = {"PERSON", "ORG", "GPE", "PRODUCT", "NORP", "FAC"}
+                from id_utils import make_id
+                entity_dicts = [
+                    {"entity_id": make_id("ent_"), "name": e.text.strip(),
+                     "entity_type": e.label_.lower(), "sentiment": "neutral"}
+                    for e in _doc.ents if e.label_ in _valid_labels and len(e.text.strip()) > 1
+                ]
+                # Deduplicate by name
+                seen_names: set[str] = set()
+                unique_entities = []
+                for ed in entity_dicts:
+                    if ed["name"] not in seen_names:
+                        seen_names.add(ed["name"])
+                        unique_entities.append(ed)
+                if unique_entities:
+                    st.session_state["_auto_detected_entities"] = [e["name"] for e in unique_entities]
+                    print(f"[get_real_verdict] auto_store_claim_with_entities  claim_id={output.claim_id!r}  entities={[e['name'] for e in unique_entities]}")
+                    mem.auto_store_claim_with_entities(
+                        claim_id=output.claim_id,
+                        claim_text=claim_text,
+                        article_id=make_id("art_"),
+                        entity_dicts=unique_entities,
+                    )
+            except Exception as _ee:
+                print(f"[get_real_verdict] entity auto-store skipped: {_ee}")
 
         return {
             "label":            output.verdict,
             "confidence":       output.confidence_score / 100,
-            "claim_text":       query[:200],
+            "claim_text":       claim_text[:200],
             "evidence_summary": output.reasoning,
             "bias_score":       output.bias_score,
             "image_mismatch":   output.cross_modal_flag,
-            "image_url":        None,
+            "image_url":        image_url,
             "vlm_caption":      output.cross_modal_explanation or "",
             "sources":          [{"name": url.split("/")[2] if len(url.split("/")) > 2 else url,
                                   "url": url, "credibility": 0.5}
                                  for url in (output.evidence_links or [])[:4]],
-            "charged_phrases":  [],  # TODO: integrate bias phrase detection
+            "charged_phrases":  [],
+            "verdict_id":       output.verdict_id,
+            "claim_id":         output.claim_id,
+            "_from_cache":      False,
         }
     except Exception as e:
-        st.error(f"Fact-Check Agent unavailable: {e}")
+        import traceback; traceback.print_exc()
         return {
             "label":            "misleading",
             "confidence":       0.0,
-            "claim_text":       query[:200],
+            "claim_text":       claim_text[:200],
             "evidence_summary": f"Pipeline error: {e}",
             "bias_score":       0.5,
             "image_mismatch":   False,
-            "image_url":        None,
+            "image_url":        image_url,
             "vlm_caption":      "",
             "sources":          [],
             "charged_phrases":  [],
+            "verdict_id":       "",
+            "claim_id":         "",
+            "_from_cache":      False,
         }
 
 
@@ -504,38 +601,6 @@ def render_credibility_chart(df: pd.DataFrame, entity_name: str):
     return fig
 
 
-def render_bias_chart(bias_score: float):
-    import random
-    categories = ["Political", "Emotional", "Framing", "Source", "Overall"]
-    scores = [
-        round(random.uniform(0.1, bias_score + 0.1), 2),
-        round(random.uniform(0.1, bias_score + 0.2), 2),
-        round(random.uniform(0.1, bias_score), 2),
-        round(random.uniform(0.05, max(0.06, bias_score - 0.05)), 2),
-        bias_score
-    ]
-    scores = [min(1.0, max(0.0, s)) for s in scores]
-
-    fig = go.Figure()
-    fig.add_trace(go.Bar(
-        x=scores, y=categories, orientation="h",
-        marker=dict(color=scores,
-                    colorscale=[[0, "#10b981"], [0.5, "#f59e0b"], [1, "#ef4444"]],
-                    showscale=False),
-        text=[f"{s:.0%}" for s in scores],
-        textposition="outside",
-        textfont=dict(color="#94a3b8", size=11)
-    ))
-    fig.update_layout(
-        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-        font=dict(color="#94a3b8", family="DM Sans"),
-        xaxis=dict(range=[0, 1.3], showgrid=False, visible=False),
-        yaxis=dict(gridcolor="#1e2535"),
-        height=200, margin=dict(l=10, r=60, t=10, b=10)
-    )
-    return fig
-
-
 # ─────────────────────────────────────────────
 # APP LAYOUT — original UI design preserved exactly
 # ─────────────────────────────────────────────
@@ -590,24 +655,36 @@ with entity_col:
 st.markdown("<div style='height:1rem'></div>", unsafe_allow_html=True)
 
 # ─────────────────────────────────────────────
-# RESULTS (shown after clicking VERIFY)
+# RUN PIPELINE on button click
 # ─────────────────────────────────────────────
 if run_btn and user_input.strip():
+    # Guardrail check
+    try:
+        from agents.input_guardrail import check_input
+        _guard = check_input(user_input)
+        if _guard["blocked"]:
+            st.error(f"⚠️ **Input blocked** [{_guard['risk']} risk]: {_guard['reason']}")
+            st.stop()
+    except Exception:
+        pass
+
+    st.session_state["_auto_detected_entities"] = []  # clear stale entities from last run
     with st.spinner("🔍 Agents working: Scraping → Preprocessing → Fact-Checking..."):
         result = get_real_verdict(user_input)
 
-    # ── Auto-fill entity box + run tracker ──────────────────────────────
-    # Priority 1: whatever the user already typed in the entity search box
-    # Priority 2: first named entity spaCy finds in the claim text
-    # Priority 3: first meaningful word in a URL path (e.g. /story/can-apple-seeds → "apple")
-    _auto_entity = st.session_state.get("_auto_entity", "").strip()
+    # Persist result so widget interactions don't wipe it
+    st.session_state["_last_result"]     = result
+    st.session_state["_last_user_input"] = user_input
 
-    if not _auto_entity:
-        # Try spaCy NER on the claim text
+    # Auto-fill entity box if user didn't type one
+    _user_typed_entity = entity_query.strip()
+    if not _user_typed_entity:
+        _claim_for_ner = st.session_state.get("_last_claim_text", user_input)
+        _auto_entity = ""
         try:
             import spacy as _spacy
             _nlp = _spacy.load("en_core_web_sm")
-            _doc = _nlp(user_input)
+            _doc = _nlp(_claim_for_ner)
             _valid_labels = {"PERSON", "ORG", "GPE", "PRODUCT", "NORP", "FAC"}
             _found = [e.text.strip() for e in _doc.ents
                       if e.label_ in _valid_labels and len(e.text.strip()) > 1]
@@ -616,28 +693,56 @@ if run_btn and user_input.strip():
         except Exception:
             pass
 
-    if not _auto_entity and user_input.strip().startswith("http"):
-        # Extract first meaningful word from URL path
-        try:
-            from urllib.parse import urlparse
-            _path = urlparse(user_input).path          # e.g. /story/can-apple-seeds-kill-you
-            _words = [w for w in _path.replace("/", "-").split("-")
-                      if len(w) > 3 and w.isalpha()]   # skip short words like "can", "a"
-            if _words:
-                _auto_entity = _words[0].capitalize()  # "apple" → "Apple"
-        except Exception:
-            pass
+        if not _auto_entity and user_input.strip().startswith("http"):
+            try:
+                from urllib.parse import urlparse
+                _path = urlparse(user_input).path
+                _words = [w for w in _path.replace("/", "-").split("-")
+                          if len(w) > 3 and w.isalpha()]
+                if _words:
+                    _auto_entity = _words[0].capitalize()
+            except Exception:
+                pass
 
-    if _auto_entity:
-        st.session_state["_auto_entity"] = _auto_entity
-        # Run entity tracker for this entity in the background
-        _run_entity_tracker_background("", direct_name=_auto_entity)
-        st.caption(f"Entity tracker running for **{_auto_entity}** in background — switch to the Entity & Trend tab in ~5 seconds to see results.")
+        if _auto_entity:
+            st.session_state["_auto_entity"] = _auto_entity
 
-    # ── 3 TABS ──
-    tab1, tab2, tab3 = st.tabs([
+    # Run entity tracker in background
+    _tracker_entity = st.session_state.get("_auto_entity", "").strip()
+    if _tracker_entity:
+        _run_entity_tracker_background("", direct_name=_tracker_entity)
+
+
+# ─────────────────────────────────────────────
+# RESULTS — rendered from session state so they survive widget reruns
+# ─────────────────────────────────────────────
+result = st.session_state.get("_last_result")
+if result is not None:
+    _user_input_display = st.session_state.get("_last_user_input", "")
+    _image_url   = st.session_state.get("_last_image_url", result.get("image_url", ""))
+    _claim_text  = st.session_state.get("_last_claim_text", result.get("claim_text", ""))
+    _auto_dets   = st.session_state.get("_auto_detected_entities", [])
+    _tracker_ent = st.session_state.get("_auto_entity", "").strip()
+
+    # Pills banner for tracked entities
+    _all_tracked = []
+    if _tracker_ent:
+        _all_tracked.append(_tracker_ent)
+    for _ae in _auto_dets:
+        if _ae not in _all_tracked:
+            _all_tracked.append(_ae)
+    if _all_tracked:
+        _pills_html = " ".join(
+            f'<span style="background:#1e2535;border:1px solid #4f46e5;border-radius:999px;'
+            f'padding:3px 10px;font-size:0.75rem;color:#a78bfa;margin:2px;">📍 {e}</span>'
+            for e in _all_tracked[:6]
+        )
+        st.markdown(f'<div style="margin-bottom:0.8rem">Tracking: {_pills_html}</div>',
+                    unsafe_allow_html=True)
+
+    # ── 2 TABS ──
+    tab1, tab2 = st.tabs([
         "📋  Fact Verdict",
-        "🎭  Perspective & Bias",
         "📈  Entity & Trend"
     ])
 
@@ -674,80 +779,103 @@ if run_btn and user_input.strip():
             else:
                 st.markdown('<span style="color:#475569; font-size:0.85rem;">No external sources retrieved.</span>', unsafe_allow_html=True)
 
+            # ── Human Feedback Form ─────────────────────────────────────
+            _verdict_id = result.get("verdict_id", "")
+            if _verdict_id:
+                st.markdown('<div class="section-header" style="margin-top:1.2rem">Correct This Verdict</div>', unsafe_allow_html=True)
+                with st.form(key="feedback_form"):
+                    _fb_label = st.radio(
+                        "Correct label",
+                        ["supported", "refuted", "misleading"],
+                        index=["supported", "refuted", "misleading"].index(result["label"])
+                            if result["label"] in ["supported", "refuted", "misleading"] else 2,
+                        horizontal=True,
+                    )
+                    _fb_conf = st.slider("Correct confidence", 0, 100,
+                                         int(result["confidence"] * 100), step=5)
+                    _fb_note = st.text_input("Note (optional)", placeholder="Why is this verdict incorrect?")
+                    _fb_submit = st.form_submit_button("Submit Correction")
+
+                if _fb_submit:
+                    _mem = _get_memory()
+                    if _mem is not None:
+                        try:
+                            _mem.update_verdict_with_feedback(
+                                verdict_id=_verdict_id,
+                                correct_label=_fb_label,
+                                correct_confidence=_fb_conf / 100,
+                                feedback_note=_fb_note,
+                            )
+                            # Patch session state so UI reflects immediately
+                            st.session_state["_last_result"]["label"]      = _fb_label
+                            st.session_state["_last_result"]["confidence"] = _fb_conf / 100
+                            st.success(f"Correction saved → {_fb_label.upper()} at {_fb_conf}%")
+                            st.rerun()
+                        except Exception as _fe:
+                            st.error(f"Could not save correction: {_fe}")
+                    else:
+                        st.warning("Memory agent not available.")
+
         with right:
             st.markdown('<div class="section-header">Confidence Score</div>', unsafe_allow_html=True)
             st.plotly_chart(render_confidence_gauge(result["confidence"], label),
                             use_container_width=True, config={"displayModeBar": False})
 
+            # ── Image Cross-Check ───────────────────────────────────────
             st.markdown('<div class="section-header" style="margin-top:0.5rem">Image Cross-Check</div>', unsafe_allow_html=True)
-            if result["image_mismatch"]:
-                explanation = result.get("vlm_caption") or "The article image does not match the described event context."
-                st.markdown(f"""
-                <div class="img-mismatch-warning">
-                    ⚠️ <strong>Image Mismatch Detected</strong><br>
-                    {explanation}
-                </div>
-                """, unsafe_allow_html=True)
+            if _image_url:
+                if result["image_mismatch"]:
+                    explanation = result.get("vlm_caption") or "The article image does not match the described event context."
+                    st.markdown(f"""
+                    <div class="img-mismatch-warning">
+                        ⚠️ <strong>Image Mismatch Detected</strong><br>
+                        {explanation}
+                    </div>
+                    """, unsafe_allow_html=True)
+                else:
+                    caption_text = result.get("vlm_caption") or "Image content aligns with the article claim."
+                    st.markdown(f"""
+                    <div class="img-match-ok">
+                        ✓ <strong>Image Consistent</strong><br>
+                        {caption_text}
+                    </div>
+                    """, unsafe_allow_html=True)
+                st.image(_image_url,
+                         caption=result["vlm_caption"] if result.get("vlm_caption") else "Article image",
+                         use_container_width=True)
             else:
                 st.markdown("""
-                <div class="img-match-ok">
-                    ✓ <strong>Image Consistent</strong><br>
-                    Image content aligns with the article claim.
+                <div style="color:#475569; font-size:0.85rem; padding:0.5rem 0;">
+                    🖼️ No image detected in this article.
                 </div>
                 """, unsafe_allow_html=True)
 
-            if result.get("image_url"):
-                st.markdown("<div style='height:0.5rem'></div>", unsafe_allow_html=True)
-                st.image(result["image_url"],
-                         caption=f"VLM Caption: {result['vlm_caption']}" if result.get("vlm_caption") else None,
-                         use_container_width=True)
+            # ── Snapshot counter ────────────────────────────────────────
+            _snap_entity = _tracker_ent or (_auto_dets[0] if _auto_dets else "")
+            if _snap_entity:
+                _mem2 = _get_memory()
+                if _mem2 is not None:
+                    try:
+                        _edict = _mem2.get_entity_by_name(_snap_entity)
+                        if _edict:
+                            _snaps = _mem2.get_entity_snapshots(_edict["entity_id"], limit=5)
+                            _snap_count = len(_snaps)
+                            _needed = 3
+                            st.markdown(f"""
+                            <div style="margin-top:0.8rem; font-size:0.8rem; color:#94a3b8;">
+                                📊 SNAPSHOTS FOUND {_snap_count} / {_needed} needed for credibility graph
+                            </div>
+                            """, unsafe_allow_html=True)
+                            st.progress(min(_snap_count / _needed, 1.0))
+                    except Exception:
+                        pass
 
     # ─────────────────────
-    # TAB 2: BIAS
+    # TAB 2: ENTITY & TREND
     # ─────────────────────
     with tab2:
-        st.markdown('<div class="section-header">Bias Analysis</div>', unsafe_allow_html=True)
-
-        b_left, b_right = st.columns([3, 2])
-
-        with b_left:
-            st.markdown('<div class="section-header">Emotionally Charged Text</div>', unsafe_allow_html=True)
-            highlighted = user_input
-            for phrase in result.get("charged_phrases", []):
-                css_class = f"highlight-{phrase['intensity']}"
-                highlighted = highlighted.replace(
-                    phrase["text"],
-                    f'<span class="{css_class}">{phrase["text"]}</span>'
-                )
-            st.markdown(f'<div class="bias-text">{highlighted}</div>', unsafe_allow_html=True)
-            st.markdown("""
-            <div style="margin-top:0.8rem; font-size:0.78rem; color:#64748b; display:flex; gap:16px;">
-                <span><span class="highlight-high">■</span> High intensity</span>
-                <span><span class="highlight-med">■</span> Medium</span>
-                <span><span class="highlight-low">■</span> Low</span>
-            </div>
-            """, unsafe_allow_html=True)
-
-        with b_right:
-            st.markdown('<div class="section-header">Bias Breakdown</div>', unsafe_allow_html=True)
-            st.plotly_chart(render_bias_chart(result["bias_score"]),
-                            use_container_width=True, config={"displayModeBar": False})
-
-            overall_bias = result["bias_score"]
-            bias_label = "Low" if overall_bias < 0.35 else ("Moderate" if overall_bias < 0.65 else "High")
-            bias_color = "#10b981" if overall_bias < 0.35 else ("#f59e0b" if overall_bias < 0.65 else "#ef4444")
-            st.markdown(f"""
-            <div class="metric-box" style="margin-top:0.5rem">
-                <div class="metric-value" style="color:{bias_color};">{overall_bias:.0%}</div>
-                <div class="metric-label">Overall Bias Score — {bias_label}</div>
-            </div>
-            """, unsafe_allow_html=True)
-
-    # ─────────────────────
-    # TAB 3: ENTITY & TREND
-    # ─────────────────────
-    with tab3:
-        entity_name = entity_query.strip() if entity_query.strip() else "Tesla"
+        entity_name = entity_query.strip() if entity_query.strip() else \
+                      (_auto_dets[0] if _auto_dets else _tracker_ent or "Tesla")
         st.markdown(f'<div class="section-header">Entity Profile — {entity_name}</div>', unsafe_allow_html=True)
 
         df = get_real_entity_history(entity_name)

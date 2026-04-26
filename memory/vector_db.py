@@ -1,0 +1,177 @@
+"""ChromaDB wrapper managing all collections.
+
+Original 4 collections from Task 1, plus source_credibility collection
+added for Task 2's Reflection Agent.
+"""
+
+import logging
+
+import chromadb
+
+logger = logging.getLogger(__name__)
+
+
+class VectorStore:
+    def __init__(self, api_key: str = "", tenant: str = "", database: str = "",
+                 host: str = "", port: int = 8000):
+        if api_key:
+            # ChromaDB Cloud
+            self._client = chromadb.CloudClient(api_key=api_key, tenant=tenant, database=database)
+        elif host:
+            # Local Docker ChromaDB
+            self._client = chromadb.HttpClient(host=host, port=port)
+        else:
+            # Persistent local store — survives process restarts
+            import os
+            _chroma_path = os.path.normpath(
+                os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "chroma_data")
+            )
+            os.makedirs(_chroma_path, exist_ok=True)
+            logger.info("ChromaDB using persistent local store at: %s", _chroma_path)
+            self._client = chromadb.PersistentClient(path=_chroma_path)
+
+        self._claims             = self._client.get_or_create_collection("claims")
+        self._articles           = self._client.get_or_create_collection("articles")
+        self._verdicts           = self._client.get_or_create_collection("verdicts")
+        self._image_captions     = self._client.get_or_create_collection("image_captions")
+        self._source_credibility = self._client.get_or_create_collection("source_credibility")
+
+    # ── Claims ──────────────────────────────────────────────────────────
+
+    def upsert_claim(self, claim_id: str, embedding: list[float], document: str,
+                     article_id: str, source_id: str, status: str, extracted_at: str) -> None:
+        self._claims.upsert(
+            ids=[claim_id],
+            embeddings=[embedding],
+            documents=[document],
+            metadatas=[{"article_id": article_id, "source_id": source_id,
+                        "status": status, "extracted_at": extracted_at}],
+        )
+
+    def search_similar_claims(self, query_embedding: list[float], top_k: int = 5) -> dict:
+        return self._claims.query(query_embeddings=[query_embedding], n_results=top_k)
+
+    def get_claims_by_ids(self, ids: list[str]) -> dict:
+        if not ids:
+            return {"ids": [], "documents": [], "metadatas": []}
+        return self._claims.get(ids=ids)
+
+    # ── Articles ────────────────────────────────────────────────────────
+
+    def upsert_article(self, article_id: str, embedding: list[float], document: str,
+                       source_id: str, domain: str, content_hash: str, published_at: str) -> None:
+        self._articles.upsert(
+            ids=[article_id],
+            embeddings=[embedding],
+            documents=[document],
+            metadatas=[{"source_id": source_id, "domain": domain,
+                        "content_hash": content_hash, "published_at": published_at}],
+        )
+
+    def check_content_hash_exists(self, content_hash: str) -> bool:
+        results = self._articles.get(where={"content_hash": content_hash}, limit=1)
+        return len(results["ids"]) > 0
+
+    # ── Verdicts ────────────────────────────────────────────────────────
+
+    def upsert_verdict(self, verdict_id: str, embedding: list[float], document: str,
+                       claim_id: str, label: str, confidence: float, bias_score: float,
+                       image_mismatch: bool, verified_at: str) -> None:
+        self._verdicts.upsert(
+            ids=[verdict_id],
+            embeddings=[embedding],
+            documents=[document],
+            metadatas=[{"claim_id": claim_id, "label": label, "confidence": confidence,
+                        "bias_score": bias_score, "image_mismatch": image_mismatch,
+                        "verified_at": verified_at}],
+        )
+
+    def get_verdict_by_claim(self, claim_id: str) -> dict:
+        return self._verdicts.get(where={"claim_id": claim_id})
+
+    def update_verdict_metadata(self, verdict_id: str, label: str, confidence: float) -> None:
+        """Patch label + confidence on an existing verdict (human feedback)."""
+        existing = self._verdicts.get(ids=[verdict_id], include=["metadatas", "embeddings", "documents"])
+        if not existing["ids"]:
+            return
+        meta = dict(existing["metadatas"][0])
+        meta["label"]          = label
+        meta["confidence"]     = confidence
+        meta["human_feedback"] = True
+        self._verdicts.upsert(
+            ids=[verdict_id],
+            embeddings=[existing["embeddings"][0]],
+            documents=[existing["documents"][0]],
+            metadatas=[meta],
+        )
+
+    def find_human_verdict_by_embedding(self, embedding: list[float], threshold: float = 0.70) -> dict | None:
+        """Return the nearest human-corrected verdict above threshold, or None."""
+        try:
+            results = self._verdicts.query(
+                query_embeddings=[embedding],
+                n_results=5,
+                include=["metadatas", "distances"],
+            )
+            if not results["ids"] or not results["ids"][0]:
+                return None
+            for rid, meta, dist in zip(
+                results["ids"][0], results["metadatas"][0], results["distances"][0]
+            ):
+                hf = meta.get("human_feedback")
+                if not (hf is True or str(hf).lower() == "true"):
+                    continue
+                # L2 distance → similarity (0=identical → 1.0)
+                similarity = 1.0 / (1.0 + dist)
+                if similarity >= threshold:
+                    result = dict(meta)
+                    result["verdict_id"]   = rid
+                    result["_similarity"]  = round(similarity, 3)
+                    return result
+        except Exception as e:
+            logger.warning("find_human_verdict_by_embedding failed: %s", e)
+        return None
+
+    # ── Image Captions ──────────────────────────────────────────────────
+
+    def upsert_caption(self, caption_id: str, embedding: list[float], document: str,
+                       article_id: str, image_url: str) -> None:
+        self._image_captions.upsert(
+            ids=[caption_id],
+            embeddings=[embedding],
+            documents=[document],
+            metadatas=[{"article_id": article_id, "image_url": image_url}],
+        )
+
+    def get_caption_by_article(self, article_id: str) -> dict:
+        return self._image_captions.get(where={"article_id": article_id})
+
+    # ── Source Credibility (for Reflection Agent) ───────────────────────
+
+    def upsert_source_credibility_point(self, point_id: str, embedding: list[float],
+                                         document: str, source_id: str, credibility: float,
+                                         bias: float, verdict_label: str, verdict_id: str,
+                                         created_at: str) -> None:
+        """Append a (source, topic, credibility, bias) observation."""
+        self._source_credibility.upsert(
+            ids=[point_id],
+            embeddings=[embedding],
+            documents=[document],
+            metadatas=[{
+                "source_id":     source_id,
+                "credibility":   credibility,
+                "bias":          bias,
+                "verdict_label": verdict_label,
+                "verdict_id":    verdict_id,
+                "created_at":    created_at,
+            }],
+        )
+
+    def query_source_credibility(self, query_embedding: list[float], source_id: str,
+                                  k: int = 20) -> dict:
+        """Retrieve k nearest (source, topic) observations for a given source."""
+        return self._source_credibility.query(
+            query_embeddings=[query_embedding],
+            n_results=k,
+            where={"source_id": source_id},
+        )
